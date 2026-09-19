@@ -47,34 +47,34 @@ def _resource_path(relative: str) -> Path:
 ctk.set_appearance_mode("dark")
 ctk.set_default_color_theme("blue")
 
-BG_MAIN = "#0b0b12"
-BG_SIDEBAR = "#0e0e18"
-BG_CARD = "#13131d"
-BG_DEVICE_CARD_TOP = "#24203a"
-BG_DEVICE_CARD_BOT = "#151522"
-BG_ANC_TILE = "#13131d"
-BG_ANC_TILE_HOVER = "#181824"
-BG_ANC_SELECTED = "#211c39"
-BG_GAMING_CARD = "#171525"
+BG_MAIN = "#0A0B10"
+BG_SIDEBAR = "#10121A"
+BG_CARD = "#141722"
+BG_DEVICE_CARD_TOP = "#251C3B"
+BG_DEVICE_CARD_BOT = "#141722"
+BG_ANC_TILE = "#141722"
+BG_ANC_TILE_HOVER = "#1B1F2D"
+BG_ANC_SELECTED = "#251C3B"
+BG_GAMING_CARD = "#1A1722"
 
-FG_TEXT = "#f7f5ff"
-FG_SUBTLE = "#9a97aa"
-FG_TINY = "#777486"
-FG_EYEBROW = "#b7a0ff"
-FG_BATTERY = "#84edbd"
-FG_BATTERY_LOW = "#ff8c75"
-FG_CONNECTED = "#72e6b1"
-FG_DISCONNECTED = "#ff8c75"
-FG_MARK = "#ff7759"
-FG_ANC_ICON = "#c5b3ff"
-FG_ACCENT = "#9c7cff"
-FG_BADGE = "#c5b3ff"
-FG_GAMING = "#ff896f"
+FG_TEXT = "#FFFFFF"
+FG_SUBTLE = "#A5ABC2"
+FG_TINY = "#727891"
+FG_EYEBROW = "#A89CF7"
+FG_BATTERY = "#00FFA3"
+FG_BATTERY_LOW = "#FF4B4B"
+FG_CONNECTED = "#00FFA3"
+FG_DISCONNECTED = "#FF4B4B"
+FG_MARK = "#00E5FF"
+FG_ANC_ICON = "#A89CF7"
+FG_ACCENT = "#A89CF7"
+FG_BADGE = "#A89CF7"
+FG_GAMING = "#FF4B4B"
 
-BORDER_CARD = "#1e1e2e"
-BORDER_ANC = "#1e1e2e"
-BORDER_ANC_SEL = "#9c7cff"
-BORDER_DEVICE = "#3a2e55"
+BORDER_CARD = "#212638"
+BORDER_ANC = "#212638"
+BORDER_ANC_SEL = "#A89CF7"
+BORDER_DEVICE = "#403166"
 
 FONT_MAIN = ("Segoe UI", 13)
 FONT_BOLD = ("Segoe UI", 13, "bold")
@@ -578,6 +578,41 @@ class MainWindow(ctk.CTk):
             btn.pack(fill="x", padx=8, pady=2)
             self._nav_buttons[page_name] = btn
 
+        # Start with Windows toggle
+        import winreg
+        self._startup_var = tk.BooleanVar()
+        try:
+            k = winreg.OpenKey(winreg.HKEY_CURRENT_USER, r"Software\Microsoft\Windows\CurrentVersion\Run", 0, winreg.KEY_READ)
+            winreg.QueryValueEx(k, "SpigenAudioCTRL")
+            self._startup_var.set(True)
+            winreg.CloseKey(k)
+        except OSError:
+            self._startup_var.set(False)
+
+        def _on_startup_toggled():
+            enable = self._startup_var.get()
+            try:
+                k = winreg.OpenKey(winreg.HKEY_CURRENT_USER, r"Software\Microsoft\Windows\CurrentVersion\Run", 0, winreg.KEY_SET_VALUE)
+                if enable:
+                    # If running as an EXE, sys.executable is the .exe itself
+                    cmd = f'"{sys.executable}" --minimized' if getattr(sys, 'frozen', False) else f'"{sys.executable}" -m spigen_audio_ctrl --minimized'
+                    winreg.SetValueEx(k, "SpigenAudioCTRL", 0, winreg.REG_SZ, cmd)
+                else:
+                    try:
+                        winreg.DeleteValue(k, "SpigenAudioCTRL")
+                    except FileNotFoundError:
+                        pass
+                winreg.CloseKey(k)
+            except OSError as e:
+                print(f"Failed to set startup key: {e}")
+
+        startup_sw = ctk.CTkSwitch(
+            sb, text="Start with Windows", variable=self._startup_var,
+            command=_on_startup_toggled, font=FONT_SMALL, text_color=FG_SUBTLE,
+            progress_color=FG_ACCENT
+        )
+        startup_sw.pack(anchor="w", padx=16, pady=(16, 0))
+
         # Spacer
         ctk.CTkFrame(sb, fg_color="transparent").pack(fill="both", expand=True)
 
@@ -905,11 +940,12 @@ class MainWindow(ctk.CTk):
             self._battery_frame.pack_forget()
             self._firmware_label.pack_forget()
 
+        self._update_tray_title()
+
     def _on_battery(self, level: int) -> None:
-        self._battery_label.configure(
-            text=f"{level}%",
-            text_color=FG_BATTERY_LOW if level <= 20 else FG_BATTERY,
-        )
+        self._battery_label.configure(text=f"{level}%")
+        self._battery_label.configure(text_color=FG_BATTERY if level > 20 else FG_BATTERY_LOW)
+        self._update_tray_title()
         self._battery_bar.set(level / 100)
         self._battery_bar.configure(
             progress_color=FG_BATTERY_LOW if level <= 20 else FG_CONNECTED
@@ -1157,10 +1193,7 @@ class MainWindow(ctk.CTk):
             if icon_path.exists():
                 img = PILImage.open(str(icon_path)).convert("RGBA")
             else:
-                # Fallback: plain purple square
                 img = PILImage.new("RGBA", (64, 64), "#9c7cff")
-
-            status = "Connected" if self.service.connected else "Disconnected"
 
             def _show(_icon=None, _item=None):
                 self._tray_restore()
@@ -1174,29 +1207,58 @@ class MainWindow(ctk.CTk):
             def _quit(_icon=None, _item=None):
                 self._tray_quit()
 
-            menu = pystray.Menu(
-                pystray.MenuItem("Show window", _show, default=True),
-                pystray.MenuItem(
-                    f"Status: {status}", lambda *_: None, enabled=False
-                ),
-                pystray.Menu.SEPARATOR,
-                pystray.MenuItem("Disconnect" if self.service.connected else "Connect",
-                                 _toggle),
-                pystray.Menu.SEPARATOR,
-                pystray.MenuItem("Quit", _quit),
-            )
+            def _set_anc(mode: int):
+                return lambda _i=None, _item=None: self.service.set_anc_mode(mode)
+
+            def _menu_generator():
+                status = "Disconnected"
+                if self.service.connected:
+                    bat = self.service.battery_level
+                    status = f"Connected ({bat}%)" if bat is not None else "Connected"
+
+                yield pystray.MenuItem("Show window", _show, default=True)
+                yield pystray.MenuItem(f"Status: {status}", lambda *_: None, enabled=False)
+                yield pystray.Menu.SEPARATOR
+
+                # ANC sub-controls
+                if self.service.connected:
+                    # IDs: 1=ANC On, 2=Transparency, 0=Off
+                    # But the read values from hardware are: 66816 (On), 66817 (Trans), 66818 (Off)
+                    yield pystray.MenuItem("ANC: On", _set_anc(1), checked=lambda i: self._anc_var.get() == 66816, radio=True)
+                    yield pystray.MenuItem("ANC: Transparency", _set_anc(2), checked=lambda i: self._anc_var.get() == 66817, radio=True)
+                    yield pystray.MenuItem("ANC: Off", _set_anc(0), checked=lambda i: self._anc_var.get() == 66818, radio=True)
+                    yield pystray.Menu.SEPARATOR
+
+                action = "Disconnect" if self.service.connected else "Connect"
+                yield pystray.MenuItem(action, _toggle)
+                yield pystray.Menu.SEPARATOR
+                yield pystray.MenuItem("Quit", _quit)
+
+            menu = pystray.Menu(_menu_generator)
 
             self._tray = pystray.Icon(
                 "SpigenAudioCTRL", img,
                 "Spigen Audio CTRL", menu
             )
+            self._update_tray_title()
             self._tray_thread = threading.Thread(
                 target=self._tray.run, daemon=True, name="tray"
             )
             self._tray_thread.start()
+
         except Exception as exc:
             print(f"[TRAY] Failed to create tray icon: {exc}")
             self.deiconify()   # show window again if tray fails
+
+    def _update_tray_title(self) -> None:
+        if self._tray:
+            if self.service.connected:
+                bat = self.service.battery_level
+                self._tray.title = f"Spigen Audio CTRL\nConnected ({bat}%)" if bat is not None else "Spigen Audio CTRL\nConnected"
+                self._tray.update_menu()
+            else:
+                self._tray.title = "Spigen Audio CTRL\nDisconnected"
+                self._tray.update_menu()
 
     def _tray_restore(self) -> None:
         """Called from the tray thread — schedule UI change on main thread."""
@@ -1230,6 +1292,8 @@ class MainWindow(ctk.CTk):
 
 def main() -> int:
     app = MainWindow()
+    if "--minimized" in sys.argv and _TRAY_AVAILABLE:
+        app._minimize_to_tray()
     app.mainloop()
     return 0
 
