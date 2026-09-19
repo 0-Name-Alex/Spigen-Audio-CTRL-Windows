@@ -16,6 +16,7 @@ import json
 import math
 import os
 import sys
+import threading
 import tkinter as tk
 import tkinter.simpledialog as simpledialog
 from dataclasses import dataclass
@@ -23,9 +24,22 @@ from pathlib import Path
 from typing import Any, Callable
 
 import customtkinter as ctk
+try:
+    import pystray
+    from PIL import Image as PILImage
+    _TRAY_AVAILABLE = True
+except ImportError:
+    _TRAY_AVAILABLE = False
 
 from .bluetooth_win import BluetoothService, ScannedDevice
 from .protocol import EQ_FREQUENCIES, HardwareInfo
+
+
+def _resource_path(relative: str) -> Path:
+    """Locate a bundled asset — works both during development and in a
+    PyInstaller one-file .exe (where files live in sys._MEIPASS)."""
+    base = Path(getattr(sys, "_MEIPASS", Path(__file__).parent.parent))
+    return base / relative
 
 # ---------------------------------------------------------------------------
 # Theme / colour palette (mirrors the original dark palette)
@@ -390,6 +404,14 @@ class MainWindow(ctk.CTk):
         self.minsize(880, 580)
         self.configure(fg_color=BG_MAIN)
 
+        # ── Window icon ────────────────────────────────────────────────
+        _ico = _resource_path("assets/icon.ico")
+        if _ico.exists():
+            try:
+                self.iconbitmap(str(_ico))
+            except Exception:
+                pass
+
         # BLE service (schedule_callback → root.after(0, fn))
         self.service = BluetoothService(schedule_callback=lambda fn: self.after(0, fn))
         self.service.on_connection = self._on_connection
@@ -416,6 +438,10 @@ class MainWindow(ctk.CTk):
         self._anc_var = tk.IntVar(value=66816)  # Adaptive ANC default
         self._show_harman_var = tk.BooleanVar(value=True)
         self._current_page = "anc"
+
+        # ── Tray state ─────────────────────────────────────────────────
+        self._tray: "pystray.Icon | None" = None
+        self._tray_thread: threading.Thread | None = None
 
         self._build_ui()
         self.protocol("WM_DELETE_WINDOW", self._on_close)
@@ -1109,6 +1135,89 @@ class MainWindow(ctk.CTk):
     # ------------------------------------------------------------------
 
     def _on_close(self) -> None:
+        """Closing the window minimizes to tray (if available), doesn't quit."""
+        if _TRAY_AVAILABLE:
+            self._minimize_to_tray()
+        else:
+            self._quit_app()
+
+    # ------------------------------------------------------------------
+    # System tray
+    # ------------------------------------------------------------------
+
+    def _minimize_to_tray(self) -> None:
+        self.withdraw()          # hide main window
+        if self._tray is None:
+            self._start_tray()
+
+    def _start_tray(self) -> None:
+        """Build and run the pystray icon in a daemon thread."""
+        try:
+            icon_path = _resource_path("assets/icon.png")
+            if icon_path.exists():
+                img = PILImage.open(str(icon_path)).convert("RGBA")
+            else:
+                # Fallback: plain purple square
+                img = PILImage.new("RGBA", (64, 64), "#9c7cff")
+
+            status = "Connected" if self.service.connected else "Disconnected"
+
+            def _show(_icon=None, _item=None):
+                self._tray_restore()
+
+            def _toggle(_icon=None, _item=None):
+                if self.service.connected:
+                    self.service.disconnect()
+                else:
+                    self.service.connect()
+
+            def _quit(_icon=None, _item=None):
+                self._tray_quit()
+
+            menu = pystray.Menu(
+                pystray.MenuItem("Show window", _show, default=True),
+                pystray.MenuItem(
+                    f"Status: {status}", lambda *_: None, enabled=False
+                ),
+                pystray.Menu.SEPARATOR,
+                pystray.MenuItem("Disconnect" if self.service.connected else "Connect",
+                                 _toggle),
+                pystray.Menu.SEPARATOR,
+                pystray.MenuItem("Quit", _quit),
+            )
+
+            self._tray = pystray.Icon(
+                "SpigenAudioCTRL", img,
+                "Spigen Audio CTRL", menu
+            )
+            self._tray_thread = threading.Thread(
+                target=self._tray.run, daemon=True, name="tray"
+            )
+            self._tray_thread.start()
+        except Exception as exc:
+            print(f"[TRAY] Failed to create tray icon: {exc}")
+            self.deiconify()   # show window again if tray fails
+
+    def _tray_restore(self) -> None:
+        """Called from the tray thread — schedule UI change on main thread."""
+        self.after(0, self._restore_window)
+
+    def _restore_window(self) -> None:
+        if self._tray:
+            self._tray.stop()
+            self._tray = None
+        self.deiconify()
+        self.lift()
+        self.focus_force()
+
+    def _tray_quit(self) -> None:
+        """Called from the tray thread — schedule full quit on main thread."""
+        self.after(0, self._do_quit)
+
+    def _do_quit(self) -> None:
+        if self._tray:
+            self._tray.stop()
+            self._tray = None
         if self._eq_after_id is not None:
             self.after_cancel(self._eq_after_id)
         self.service.close()
