@@ -24,9 +24,11 @@ python -m PyInstaller ^
     --windowed ^
     --icon=assets\icon.ico ^
     --add-data "assets;assets" ^
+    --hidden-import "pystray._win32" ^
+    --hidden-import "PIL._tkinter_finder" ^
     --name "SpigenAudioCTRL" ^
     --clean ^
-    spigen_audio_ctrl\__main__.py
+    run.py
 
 if %errorlevel% neq 0 (
     echo.
