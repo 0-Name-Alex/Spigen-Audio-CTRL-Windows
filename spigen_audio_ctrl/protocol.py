@@ -1,7 +1,4 @@
-"""Encoding and decoding for the headphones' proprietary RCSP protocol.
-
-This file is platform-independent — identical to the Linux version.
-"""
+"""Encoding and decoding for the headphones' proprietary RCSP protocol."""
 
 from __future__ import annotations
 
@@ -41,65 +38,66 @@ def encode_gaming_mode(enabled: bool, sequence: int = 1) -> bytes:
 
 def encode_key_mapping(key_number: int, action: int, function: int, sequence: int = 1) -> bytes:
     jl_function = 127 if function == 0 else function
-    return pack_rcsp(0xC0, bytes((2, key_number, action, jl_function)), sequence)
+    return pack_rcsp(0xC0, bytes((4, 2, key_number & 0xFF, action & 0xFF, jl_function & 0xFF)), sequence)
 
 
-def encode_equalizer(gains: list[float], sequence: int = 1) -> bytes:
-    """Pack a 10-band EQ into an RCSP write packet."""
-    payload = bytearray()
-    for gain, q in zip(gains, EQ_Q_VALUES):
-        raw = int(round(gain * 10))
-        payload += pack(">h", max(-80, min(80, raw)))
-        payload += pack(">H", int(round(q * 100)))
-    return pack_rcsp(0xC0, bytes([2, 3]) + bytes(payload), sequence)
-
-
-def parse_target_battery(data: bytes) -> int | None:
-    """Extract battery level from an RCSP response, if present."""
-    if len(data) > 8 and data[:3] == b"\xfe\xdc\xba" and data[4] == 0x0A:
-        return data[8] if 0 <= data[8] <= 100 else None
-    return None
+def encode_equalizer(
+    gains: list[float] | tuple[float, ...],
+    mode: int = 126,
+    master_gain: float = 0.0,
+    sequence: int = 1,
+) -> bytes:
+    if len(gains) != 10:
+        raise ValueError("the headphone DSP requires exactly 10 EQ gains")
+    payload = bytearray((0x20, 63, mode & 0xFF))
+    payload.extend(pack("<h", round(master_gain * 100)))
+    for frequency, gain, q_value in zip(EQ_FREQUENCIES, gains, EQ_Q_VALUES):
+        if not -8.0 <= gain <= 8.0:
+            raise ValueError("EQ gains must be between -8 and +8 dB")
+        payload.extend(pack("<Hhh", frequency, round(gain * 100), round(q_value * 100)))
+    return pack_rcsp(0xFF, bytes(payload), sequence)
 
 
 def parse_hardware_info(data: bytes) -> HardwareInfo:
-    """Decode an RCSP 0xC1 hardware-info response."""
     info = HardwareInfo()
-    if len(data) < 10:
+    if len(data) < 14:
         return info
-    try:
-        payload = data[7:-1]
-        if len(payload) < 2:
-            return info
-        sub = payload[1]
-
-        if sub == 5:
-            # Gaming mode state
-            if len(payload) >= 4:
-                info.gaming_mode = payload[3] == 2
-        elif sub == 3:
-            # EQ / key map info block — parse key settings
-            offset = 2
-            key_settings: dict[str, int] = {}
-            while offset + 2 < len(payload):
-                key_num = payload[offset]
-                action = payload[offset + 1]
-                func = payload[offset + 2]
-                key_settings[f"{key_num}_{action}"] = func
-                offset += 3
-            if key_settings:
-                info.key_settings = key_settings
-        elif sub == 0xFF:
-            # Device name / firmware info block
-            offset = 2
-            while offset + 1 < len(payload):
-                tag = payload[offset]
-                length = payload[offset + 1]
-                value = payload[offset + 2: offset + 2 + length]
-                if tag == 1:
-                    info.device_name = value.decode("utf-8", errors="replace").strip("\x00")
-                elif tag == 2:
-                    info.firmware = value.decode("utf-8", errors="replace").strip("\x00")
-                offset += 2 + length
-    except Exception:
-        pass
+    pointer = 13
+    while pointer < len(data) - 2:
+        tag_length = data[pointer]
+        if tag_length <= 0 or pointer + 1 >= len(data):
+            break
+        tag = data[pointer + 1]
+        value_length = tag_length - 1
+        value_start = pointer + 2
+        if value_start + value_length > len(data):
+            break
+        value = data[value_start:value_start + value_length]
+        pointer += tag_length + 1
+        if tag == 1:
+            info.device_name = value.rstrip(b"\0").decode("utf-8", "replace")
+        elif tag == 2:
+            for index in range(0, len(value) - 2, 3):
+                info.key_settings[f"{value[index]}_{value[index + 1]}"] = value[index + 2]
+        elif tag == 5 and value:
+            info.gaming_mode = value[0] == 2
+        elif tag == 9:
+            info.firmware = value.rstrip(b"\0").decode("utf-8", "replace")
     return info
+
+
+def parse_target_battery(data: bytes) -> int | None:
+    """Read battery TLV from an opcode 0x03 response, if present."""
+    if len(data) < 10 or data[:3] != b"\xfe\xdc\xba" or data[4] != 0x03:
+        return None
+    pointer = 8
+    while pointer + 2 < len(data) - 1:
+        tag_length = data[pointer]
+        if tag_length <= 0 or pointer + tag_length >= len(data):
+            break
+        tag, value_start = data[pointer + 1], pointer + 2
+        if tag == 1 and tag_length >= 2:
+            level = data[value_start]
+            return level if 0 <= level <= 100 else None
+        pointer += tag_length + 1
+    return None

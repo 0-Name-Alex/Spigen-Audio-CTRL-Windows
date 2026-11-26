@@ -157,6 +157,9 @@ class BluetoothService:
         self._write_uuid: str | None = None
         self._write_with_response: bool = False   # True only if char has 'write' (not just write-without-response)
         self._client: BleakClient | None = None
+        self._write_lock: asyncio.Lock | None = None
+        self._battery_uuid: str | None = None
+        self._poll_task: asyncio.Task | None = None
 
         # ── Background asyncio loop ────────────────────────────────────
         self._loop: asyncio.AbstractEventLoop = asyncio.new_event_loop()
@@ -362,6 +365,7 @@ class BluetoothService:
 
             self._write_uuid = write_uuid
             self._write_with_response = write_with_response
+            self._battery_uuid = battery_uuid
             self._log("BLE", f"Write char: {write_uuid}  response={write_with_response}")
 
             for nuuid in notify_uuids:
@@ -377,11 +381,26 @@ class BluetoothService:
                         self._set_battery(data[0])
                 except Exception:
                     pass
+                # Subscribe to battery level changes if supported
+                try:
+                    await client.start_notify(
+                        battery_uuid,
+                        lambda _h, data: self._set_battery(data[0]) if data else None,
+                    )
+                except Exception:
+                    pass
 
             self.connected = True
             self._connecting = False
             self._emit(self.on_connection, True, self.device_name)
             self._log("BLE", "Hardware engine attached and ready")
+
+            # Start background battery poll loop (every 45s)
+            if self._battery_uuid:
+                if self._poll_task and not self._poll_task.done():
+                    self._poll_task.cancel()
+                self._poll_task = self._loop.create_task(self._battery_poll_loop())
+
             await asyncio.sleep(_POST_CONNECT_DELAY)
             await self._query_hardware_async()
 
@@ -401,6 +420,9 @@ class BluetoothService:
         self._write_uuid = None
         self._write_with_response = False
         self._client = None
+        if self._poll_task and not self._poll_task.done():
+            self._poll_task.cancel()
+            self._poll_task = None
         if was_connected:
             self._emit(self.on_connection, False, "Disconnected")
             if not self._manual_disconnect:
@@ -417,12 +439,18 @@ class BluetoothService:
     def disconnect(self) -> None:
         self._manual_disconnect = True
         self._connecting = False
+        if self._poll_task and not self._poll_task.done():
+            self._poll_task.cancel()
+            self._poll_task = None
         if self._reconnect_handle:
             self._reconnect_handle.cancel()
             self._reconnect_handle = None
         self._submit(self._disconnect_worker())
 
     async def _disconnect_worker(self) -> None:
+        if self._poll_task and not self._poll_task.done():
+            self._poll_task.cancel()
+            self._poll_task = None
         client = self._client
         if client and client.is_connected:
             try:
@@ -432,9 +460,24 @@ class BluetoothService:
         self.connected = False
         self._connecting = False
         self._write_uuid = None
+        self._battery_uuid = None
         self._client = None
         self.battery_level = None
         self._emit(self.on_connection, False, "Disconnected")
+
+    async def _battery_poll_loop(self) -> None:
+        """Poll battery level every 45s while connected."""
+        while self.connected and self._client and self._battery_uuid:
+            try:
+                await asyncio.sleep(45.0)
+                if self.connected and self._client and self._battery_uuid:
+                    data = await self._client.read_gatt_char(self._battery_uuid)
+                    if data:
+                        self._set_battery(data[0])
+            except asyncio.CancelledError:
+                break
+            except Exception:
+                pass
 
     # ------------------------------------------------------------------
     # Notifications / Battery
@@ -458,6 +501,22 @@ class BluetoothService:
     # Write / Commands
     # ------------------------------------------------------------------
 
+    # Valid ANC Mode IDs recognized by Spigen SA-HP P10 firmware
+    VALID_ANC_IDS = {
+        65794,   # Deep ANC (Mode 1, Scene 1, Level 2)
+        66816,   # Adaptive ANC (Mode 1, Scene 5, Level 0)
+        66048,   # Commuting (Mode 1, Scene 2, Level 0)
+        66050,   # Commuting (Mode 1, Scene 2, Level 2)
+        66560,   # Anti-Wind (Mode 1, Scene 4, Level 0)
+        196868,  # Transparency (Mode 3, Scene 1, Level 4)
+        131072,  # Off / Passive (Mode 2, Scene 0, Level 0)
+    }
+
+    def _get_write_lock(self) -> asyncio.Lock:
+        if self._write_lock is None:
+            self._write_lock = asyncio.Lock()
+        return self._write_lock
+
     def send(self, packet: bytes) -> None:
         self._submit(self._write_packet(packet))
 
@@ -466,24 +525,51 @@ class BluetoothService:
         if not self.connected or client is None or uuid is None:
             self._log("ERR", "Headphones are not connected")
             return False
-        try:
-            await client.write_gatt_char(uuid, packet, response=self._write_with_response)
-            self._log("TX", packet.hex().upper())
-            return True
-        except Exception as error:
-            self._log("ERR", f"Write failed: {error}")
-            return False
+        async with self._get_write_lock():
+            try:
+                # Pacing & chunking: Prevent overflowing the headphone BLE UART buffer
+                chunk_size = 20
+                if hasattr(client, "mtu_size") and client.mtu_size and client.mtu_size > 3:
+                    chunk_size = max(20, client.mtu_size - 3)
+
+                for offset in range(0, len(packet), chunk_size):
+                    chunk = packet[offset:offset + chunk_size]
+                    await client.write_gatt_char(uuid, chunk, response=self._write_with_response)
+                    if len(packet) > chunk_size:
+                        await asyncio.sleep(0.015)  # 15ms pacing between multi-packet chunks
+                self._log("TX", packet.hex().upper())
+                return True
+            except Exception as error:
+                self._log("ERR", f"Write failed: {error}")
+                return False
 
     def set_anc_mode(self, anc_id: int) -> None:
+        if anc_id not in self.VALID_ANC_IDS:
+            self._log("ERR", f"Rejected unsafe ANC mode ID: {anc_id}")
+            return
         self.send(protocol.encode_anc(anc_id, self._next_sequence()))
 
     def set_equalizer(self, gains: list) -> None:
-        self.send(protocol.encode_equalizer(gains, sequence=self._next_sequence()))
+        if len(gains) != 10:
+            self._log("ERR", "Equalizer requires exactly 10 bands")
+            return
+        clamped = [max(-8.0, min(8.0, float(g))) for g in gains]
+        try:
+            packet = protocol.encode_equalizer(clamped, sequence=self._next_sequence())
+            self.send(packet)
+        except Exception as e:
+            self._log("ERR", f"EQ encode failed: {e}")
 
     def set_gaming_mode(self, enabled: bool) -> None:
-        self.send(protocol.encode_gaming_mode(enabled, self._next_sequence()))
+        self.send(protocol.encode_gaming_mode(bool(enabled), self._next_sequence()))
 
     def set_key_mapping(self, key_number: int, action: int, function: int) -> None:
+        if key_number not in (3, 5, 7):
+            self._log("ERR", f"Invalid key number: {key_number}")
+            return
+        if action not in (1, 2, 3, 5):
+            self._log("ERR", f"Invalid action code: {action}")
+            return
         self.send(protocol.encode_key_mapping(
             key_number, action, function, self._next_sequence()
         ))
@@ -506,4 +592,11 @@ class BluetoothService:
 
     def close(self) -> None:
         self.disconnect()
-        self._loop.call_soon_threadsafe(self._loop.stop)
+        def _stop_loop():
+            try:
+                for task in asyncio.all_tasks(self._loop):
+                    task.cancel()
+                self._loop.stop()
+            except Exception:
+                pass
+        self._loop.call_soon_threadsafe(_stop_loop)
